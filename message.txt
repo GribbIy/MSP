@@ -1,0 +1,1030 @@
+using System;
+using System.Collections;
+using Photon;
+using UnityEngine;
+
+public class PlayerHand : Photon.MonoBehaviour
+{
+	public enum HandType
+	{
+		Unknown = -1,
+		Left = 0,
+		Right = 1
+	}
+
+	[Serializable]
+	public class MagnetPickupSettings
+	{
+		public MagnetPickup type = MagnetPickup.Normal;
+
+		public float capsuleLength = 2f;
+
+		public float capsuleRadius = 0.15f;
+
+		public float sphereRadius = 0.25f;
+	}
+
+	public enum MagnetPickup
+	{
+		None = 0,
+		Close = 1,
+		Normal = 2,
+		Far = 3
+	}
+
+	private const float remoteHideGracePeriod = 0.01f;
+
+	private MagnetPickup _magnetPickupType;
+
+	private static int openClosedAnimatorId = Animator.StringToHash("OpenClosed");
+
+	[SerializeField]
+	[Header("Configuration")]
+	private HandType type = HandType.Unknown;
+
+	[SerializeField]
+	private float preReleaseWindow = 0.05f;
+
+	[Tooltip("Create a window of time before and after the hair trigger is pressed to attempt picking up items.")]
+	[SerializeField]
+	private float hairTriggerReactionWindow = 0.1f;
+
+	public Transform ControllerToHandTransform;
+
+	[Header("Magnet Pickup")]
+	[SerializeField]
+	private MagnetPickupSettings[] magnetPickupSettings;
+
+	private float magnetPickupCapsuleLength;
+
+	private float magnetPickupCapsuleRadius;
+
+	private float magnetPickupSphereRadius;
+
+	[SerializeField]
+	[Header("Physical Pickup")]
+	private float physicalPickupSphereRadius = 0.15f;
+
+	[SerializeField]
+	[Header("Remote")]
+	private LaserTeleporter playerHandRemotePrefab;
+
+	[SerializeField]
+	[Tooltip("Only show the remote laser if gaze and hand angle are somewhat aligned")]
+	private float maxHandHeadAngleForRemote = 45f;
+
+	[SerializeField]
+	[Header("Component References")]
+	private Transform defaultGravityPickupTransform;
+
+	[SerializeField]
+	private Transform handCenter;
+
+	[SerializeField]
+	private Transform meshRoot;
+
+	private Rigidbody rigidbody;
+
+	private PlayerHandCollider[] handColliders;
+
+	private TrackedVelocity trackedVelocity;
+
+	private Animator handAnimator;
+
+	private Tool previousHoveredTool;
+
+	private float previousHoveredToolTime;
+
+	private bool hoveredToolInPhysicalPickupRange;
+
+	private Vector3 gravityPickupVector;
+
+	private Tool _hoveredTool;
+
+	private string controllerTrackingProperty = "controllerTrackingProperty";
+
+	[HideInInspector]
+	public Player ThisPlayer;
+
+	private OutfitTrigger _triggeredOutfit;
+
+	private ControllerIO _controllerIO;
+
+	private bool isHandTrackingCached;
+
+	private Renderer[] visualRenderers;
+
+	private MagnetPickup magnetPickupTypeBeforeChangeRoom = MagnetPickup.Normal;
+
+	private bool _remoteVisible;
+
+	private bool _useControllerMesh;
+
+	private bool _handMeshesVisible = true;
+
+	private float inPersonalBubbleTimeout;
+
+	private float lastTimeInPersonalBubble;
+
+	private bool _inPersonalBubble;
+
+	private bool wasRemoteVisible;
+
+	private bool wasToolVisible;
+
+	private bool wasVisible = true;
+
+	private bool wasHandTracking = true;
+
+	private float lastRemoteShowTime;
+
+	private RaycastHit[] pickupHits = new RaycastHit[100];
+
+	private float outfitForwardPickupRange = 0.15f;
+
+	private float outfitBackwardPickupRange = 0.1f;
+
+	public MagnetPickup MagnetPickupType
+	{
+		get
+		{
+			return _magnetPickupType;
+		}
+		set
+		{
+			for (int i = 0; i < magnetPickupSettings.Length; i++)
+			{
+				if (magnetPickupSettings[i].type == value)
+				{
+					magnetPickupCapsuleLength = magnetPickupSettings[i].capsuleLength;
+					magnetPickupCapsuleRadius = magnetPickupSettings[i].capsuleRadius;
+					magnetPickupSphereRadius = magnetPickupSettings[i].sphereRadius;
+					_magnetPickupType = value;
+					return;
+				}
+			}
+			Debug.LogError(string.Concat("Can not find the settings for MagnetPickupType : ", value, ". Update the PlayerHand magnetPickupSettings array."));
+		}
+	}
+
+	public LaserTeleporter PlayerHandRemote { get; private set; }
+
+	private Tool hoveredTool
+	{
+		get
+		{
+			if (_hoveredTool == null && previousHoveredTool != null && Time.unscaledTime - previousHoveredToolTime <= hairTriggerReactionWindow)
+			{
+				return previousHoveredTool;
+			}
+			return _hoveredTool;
+		}
+		set
+		{
+			if (_hoveredTool != value)
+			{
+				if (_hoveredTool != null && _hoveredTool.ToolRenderer.Mode != ToolRenderer.HighlightMode.Locked)
+				{
+					_hoveredTool.ToolRenderer.Mode = ToolRenderer.HighlightMode.None;
+				}
+				previousHoveredTool = _hoveredTool;
+				previousHoveredToolTime = Time.unscaledTime;
+			}
+			_hoveredTool = value;
+			if (_hoveredTool != null)
+			{
+				if (_hoveredTool.IsSmartTool)
+				{
+					_hoveredTool.ToolRenderer.Mode = ToolRenderer.HighlightMode.SmartTool;
+				}
+				else if (hoveredToolInPhysicalPickupRange)
+				{
+					_hoveredTool.ToolRenderer.Mode = ToolRenderer.HighlightMode.Physical;
+				}
+				else
+				{
+					_hoveredTool.ToolRenderer.Mode = ToolRenderer.HighlightMode.Magnet;
+				}
+			}
+		}
+	}
+
+	public OutfitTrigger TriggeredOutfit
+	{
+		get
+		{
+			return _triggeredOutfit;
+		}
+		set
+		{
+			if (_triggeredOutfit != value)
+			{
+				if (_triggeredOutfit != null)
+				{
+					_triggeredOutfit.Outfit.Highlight = false;
+				}
+				_triggeredOutfit = value;
+				if (_triggeredOutfit != null)
+				{
+					_triggeredOutfit.Outfit.Highlight = true;
+				}
+			}
+		}
+	}
+
+	public PUNNetworkTransform NetworkTransform { get; private set; }
+
+	public PlayerHandGestures Gestures { get; private set; }
+
+	public ControllerIO ControllerIO
+	{
+		get
+		{
+			return _controllerIO;
+		}
+		set
+		{
+			if (_controllerIO != value)
+			{
+				if ((bool)_controllerIO)
+				{
+					_controllerIO.TransformUpdated -= OnTrackerTransformUpdate;
+				}
+				_controllerIO = value;
+				if ((bool)_controllerIO)
+				{
+					_controllerIO.TransformUpdated += OnTrackerTransformUpdate;
+				}
+			}
+		}
+	}
+
+	public Tool Tool { get; private set; }
+
+	public HandType Type
+	{
+		get
+		{
+			return type;
+		}
+	}
+
+	public Animator HandAnimator
+	{
+		get
+		{
+			return handAnimator;
+		}
+	}
+
+	public bool IsHoldingTool
+	{
+		get
+		{
+			return Tool != null;
+		}
+	}
+
+	public Vector3 PalmDirection
+	{
+		get
+		{
+			return (type != 0) ? (-ControllerToHandTransform.right) : ControllerToHandTransform.right;
+		}
+	}
+
+	public bool IsHandTracking
+	{
+		get
+		{
+			return base.photonView.owner != null && (!base.photonView.owner.customProperties.ContainsKey(controllerTrackingProperty) || (bool)base.photonView.owner.customProperties[controllerTrackingProperty]);
+		}
+		private set
+		{
+			if (base.isLocal && base.photonView.owner != null && value != IsHandTracking)
+			{
+				base.photonView.owner.SetCustomProperties(controllerTrackingProperty, value);
+			}
+		}
+	}
+
+	public Player TargetRemotePlayer
+	{
+		get
+		{
+			return (!PlayerHandRemote.MenuLaserVisible) ? null : PlayerHandRemote.TargetRemotePlayer;
+		}
+	}
+
+	public Vector3 LastHandSpacePickupPosition { get; private set; }
+
+	public Quaternion LastHandSpacePickupRotation { get; private set; }
+
+	public bool RemoteVisible
+	{
+		get
+		{
+			return _remoteVisible;
+		}
+		set
+		{
+			if (_remoteVisible != value)
+			{
+				_remoteVisible = value;
+				BroadcastRemoteVisibility(_remoteVisible);
+				UpdateVisibility();
+			}
+		}
+	}
+
+	public bool UseControllerMesh
+	{
+		get
+		{
+			return _useControllerMesh;
+		}
+		set
+		{
+			_useControllerMesh = value;
+			UpdateVisibility();
+		}
+	}
+
+	public bool MeshesVisible
+	{
+		get
+		{
+			return _handMeshesVisible;
+		}
+		set
+		{
+			_handMeshesVisible = value;
+			UpdateVisibility();
+		}
+	}
+
+	public bool InPersonalBubble
+	{
+		get
+		{
+			return _inPersonalBubble || (Tool != null && Tool.InPersonalBubble) || (!_inPersonalBubble && Time.time - lastTimeInPersonalBubble < inPersonalBubbleTimeout);
+		}
+		private set
+		{
+			_inPersonalBubble = value;
+			UpdateVisibility();
+		}
+	}
+
+	public bool IsVisible
+	{
+		get
+		{
+			return (base.isLocal || ThisPlayer.IsVisible) && MeshesVisible && !InPersonalBubble && !RemoteVisible && isHandTrackingCached && !UseControllerMesh;
+		}
+	}
+
+	public float OpenClosedAxis { get; private set; }
+
+	public event Action<PlayerHand, Tool> PickupToolEvent;
+
+	private void Awake()
+	{
+		if (ThisPlayer == null)
+		{
+			ThisPlayer = base.gameObject.GetComponentInParents<Player>();
+		}
+		NetworkTransform = GetComponent<PUNNetworkTransform>();
+		rigidbody = GetComponent<Rigidbody>();
+		handColliders = GetComponentsInChildren<PlayerHandCollider>();
+		trackedVelocity = GetComponent<TrackedVelocity>();
+		handAnimator = GetComponentInChildren<Animator>();
+		Gestures = GetComponent<PlayerHandGestures>();
+		PlayerHandRemote = UnityEngine.Object.Instantiate(playerHandRemotePrefab);
+		PlayerHandRemote.Player = ThisPlayer;
+		PlayerHandRemote.Hand = this;
+		ThisPlayer.SetParentPlayerRoot(PlayerHandRemote.transform);
+		ThisPlayer.VisibilityChanged += ThisPlayer_VisibilityChanged;
+		MagnetPickupType = MagnetPickup.Normal;
+		controllerTrackingProperty = "controllerTrackingProperty_" + Type;
+		visualRenderers = meshRoot.GetComponentsInChildren<Renderer>();
+	}
+
+	private void Start()
+	{
+		if (ActivityManager.Instance != null && ActivityManager.Instance.SupportsPlayingGame)
+		{
+			ActivityManager.Instance.PlayerManager.RolesUpdatedEvent += OnPlayerRolesUpdated;
+			ActivityManager.Instance.GameStateChangedEvent += OnGameStateChanged;
+		}
+		UpdateVisibility(true);
+	}
+
+	public void PickupTool(Tool tool, Vector3 handSpacePickupPosition, Quaternion handSpacePickupRotation)
+	{
+		if (this.PickupToolEvent != null)
+		{
+			this.PickupToolEvent(this, tool);
+		}
+		MeshesVisible = false;
+		PlayerHandCollider[] array = handColliders;
+		foreach (PlayerHandCollider playerHandCollider in array)
+		{
+			playerHandCollider.DisableHandToolCollisions(tool);
+		}
+		hoveredTool = null;
+		Tool = tool;
+		Tool.ToolRenderer.Visible = ThisPlayer.IsVisible;
+		Tool.Pickup(ThisPlayer, rigidbody, handSpacePickupPosition, handSpacePickupRotation);
+		LastHandSpacePickupPosition = handSpacePickupPosition;
+		LastHandSpacePickupRotation = handSpacePickupRotation;
+		Vibrate(50);
+	}
+
+	public void ReleaseTool()
+	{
+		PlayerHandCollider[] array = handColliders;
+		foreach (PlayerHandCollider playerHandCollider in array)
+		{
+			playerHandCollider.ReEnableHandToolCollisions(Tool);
+		}
+		Vector3 averageLinearVelocity = trackedVelocity.GetAverageLinearVelocity(preReleaseWindow);
+		Vector3 averageAngularVelocity = trackedVelocity.GetAverageAngularVelocity(preReleaseWindow);
+		Tool.Release(ThisPlayer, averageLinearVelocity, averageAngularVelocity);
+		Tool = null;
+		MeshesVisible = true;
+	}
+
+	public void GetToolPickupPositionAndRotation(Tool tool, bool useGravityPickup, Vector3 gravityPickupDirection, out Vector3 handSpacePickupPosition, out Quaternion handSpacePickupRotation)
+	{
+		if ((useGravityPickup && !tool.SupportsOffCenterGravityPickup) || !tool.SupportsOffCenterPickup)
+		{
+			if (!tool.TryGetLocalPickupTransform(base.transform, Type, out handSpacePickupPosition, out handSpacePickupRotation))
+			{
+				handSpacePickupPosition = base.transform.InverseTransformPoint(defaultGravityPickupTransform.position);
+				handSpacePickupRotation = base.transform.InverseTransformRotation(defaultGravityPickupTransform.rotation);
+			}
+			return;
+		}
+		if (useGravityPickup && tool.SupportsOffCenterGravityPickup)
+		{
+			Vector3 position = base.transform.position + Vector3.ProjectOnPlane(tool.transform.position - base.transform.position, gravityPickupDirection);
+			handSpacePickupPosition = base.transform.InverseTransformPoint(position);
+		}
+		else
+		{
+			handSpacePickupPosition = base.transform.InverseTransformPoint(tool.transform.position);
+		}
+		handSpacePickupRotation = base.transform.InverseTransformRotation(tool.transform.rotation);
+	}
+
+	public void Snap(Vector3 position, Quaternion rotation, double networkTimestamp)
+	{
+		NetworkTransform.Snap(base.transform.position, base.transform.rotation, networkTimestamp);
+		if (Tool != null)
+		{
+			Tool.SnapToHand(networkTimestamp);
+		}
+	}
+
+	public Coroutine Vibrate(int milliseconds = 1, ushort intensity = 1000)
+	{
+		return StartCoroutine(VibrateCoroutine(milliseconds, intensity));
+	}
+
+	private IEnumerator VibrateCoroutine(int milliseconds, ushort intensity)
+	{
+		float endTime = Time.unscaledTime + (float)milliseconds / 1000f;
+		while (Time.unscaledTime < endTime)
+		{
+			if (ControllerIO != null)
+			{
+				ControllerIO.Vibrate(intensity);
+			}
+			yield return null;
+		}
+	}
+
+	private void OnDestroy()
+	{
+		if (ControllerIO != null)
+		{
+			ControllerIO.TransformUpdated -= OnTrackerTransformUpdate;
+			ControllerIO.UIInteractionEnabled = true;
+		}
+		if (PlayerHandRemote != null)
+		{
+			UnityEngine.Object.Destroy(PlayerHandRemote);
+		}
+		if (ActivityManager.Instance != null && ActivityManager.Instance.SupportsPlayingGame)
+		{
+			ActivityManager.Instance.PlayerManager.RolesUpdatedEvent -= OnPlayerRolesUpdated;
+			ActivityManager.Instance.GameStateChangedEvent -= OnGameStateChanged;
+		}
+		if (Tool != null)
+		{
+			ThisPlayer.ToolController.ReleaseTool(Tool);
+		}
+	}
+
+	private void ThisPlayer_VisibilityChanged(bool visible)
+	{
+		if (ThisPlayer.IsInChangingRoom)
+		{
+			magnetPickupTypeBeforeChangeRoom = MagnetPickupType;
+			MagnetPickupType = MagnetPickup.Close;
+		}
+		else
+		{
+			MagnetPickupType = magnetPickupTypeBeforeChangeRoom;
+		}
+		UpdateVisibility();
+	}
+
+	private void OnTrackerTransformUpdate()
+	{
+		rigidbody.MovePosition(ControllerIO.transform.position);
+		rigidbody.MoveRotation(ControllerIO.transform.rotation);
+	}
+
+	private void FixedUpdate()
+	{
+		InPersonalBubble = false;
+		if (!(ControllerIO == null) && Tool == null && !RemoteVisible && isHandTrackingCached)
+		{
+			FindClosestOutfitTrigger();
+			Tool tool = FindClosestToolInPhysicalPickupRange();
+			if (tool != null)
+			{
+				hoveredToolInPhysicalPickupRange = true;
+			}
+			else
+			{
+				tool = FindClosestToolInMagnetPickupRange(out gravityPickupVector);
+				hoveredToolInPhysicalPickupRange = false;
+			}
+			hoveredTool = tool;
+		}
+	}
+
+	private void Update()
+	{
+		isHandTrackingCached = IsHandTracking;
+		UpdateVisibility();
+		if (!(ControllerIO == null))
+		{
+			if (base.isLocal)
+			{
+				IsHandTracking = ControllerIO.IsTracking;
+			}
+			UpdateAnimation();
+			UpdateTool();
+			UpdateRemoteVisibility();
+		}
+	}
+
+	public void SetInPersonalBubble(float turnVisibleTimeout)
+	{
+		InPersonalBubble = true;
+		inPersonalBubbleTimeout = turnVisibleTimeout;
+		lastTimeInPersonalBubble = Time.time;
+	}
+
+	private void UpdateVisibility(bool forceUpdate = false)
+	{
+		bool flag = base.isLocal || ThisPlayer.IsVisible;
+		bool flag2 = flag && !RemoteVisible && !InPersonalBubble;
+		bool flag3 = flag && RemoteVisible && !InPersonalBubble;
+		bool isVisible = IsVisible;
+		if (!forceUpdate && wasVisible == isVisible && wasToolVisible == flag2 && flag3 == wasRemoteVisible && isHandTrackingCached == wasHandTracking)
+		{
+			return;
+		}
+		Renderer[] array = visualRenderers;
+		foreach (Renderer renderer in array)
+		{
+			renderer.gameObject.SetActive(isVisible);
+		}
+		PlayerHandCollider[] array2 = handColliders;
+		foreach (PlayerHandCollider playerHandCollider in array2)
+		{
+			if (playerHandCollider != null && !playerHandCollider.IsTrigger)
+			{
+				playerHandCollider.gameObject.SetActive(isVisible);
+			}
+		}
+		ThisPlayer.PlayerOutfit.SetHandVisible(Type, isVisible);
+		bool modelVisible = flag && MeshesVisible && UseControllerMesh && !InPersonalBubble && isHandTrackingCached && !RemoteVisible;
+		switch (Type)
+		{
+		case HandType.Left:
+			break;
+		case HandType.Right:
+			break;
+		}
+		if (Tool != null)
+		{
+			Tool.ToolRenderer.Visible = flag2;
+		}
+		PlayerHandRemote.Visible = flag3;
+		if (!isVisible)
+		{
+			hoveredTool = null;
+		}
+		wasVisible = isVisible;
+		wasToolVisible = flag2;
+		wasRemoteVisible = flag3;
+		wasHandTracking = isHandTrackingCached;
+	}
+
+	private void UpdateRemoteVisibility()
+	{
+		if (base.isLocal)
+		{
+			ControllerIO.UIInteractionEnabled = CanMenuLaserInterract();
+			bool flag = PlayerHandRemote.TeleportLaserVisible || PlayerHandRemote.MenuLaserVisible || (ControllerIO.UIInteractionEnabled && ControllerIO.UIRaycastPosition.HasValue);
+			if (flag)
+			{
+				lastRemoteShowTime = Time.time;
+			}
+			if (flag || (!flag && Time.time - lastRemoteShowTime > 0.01f))
+			{
+				RemoteVisible = flag;
+			}
+		}
+	}
+
+	private bool CanMenuLaserInterract()
+	{
+		return !PlayerHandRemote.TeleportLaserVisible && isHandTrackingCached && Vector3.Angle(base.transform.forward, ThisPlayer.Head.transform.forward) < maxHandHeadAngleForRemote && ((Tool == null && hoveredTool == null) || PlayerHandRemote.MenuLaserVisible);
+	}
+
+	private Tool FindClosestToolInPhysicalPickupRange()
+	{
+		Tool closestTool = null;
+		float closestToolDistance = float.MaxValue;
+		FindClosestToolInSphere(ref closestTool, ref closestToolDistance, physicalPickupSphereRadius, true);
+		return closestTool;
+	}
+
+	private Tool FindClosestToolInSphere(ref Tool closestTool, ref float closestToolDistance, float radius, bool physicalPickup)
+	{
+		Collider[] array = Physics.OverlapSphere(handCenter.position, radius, 402432);
+		for (int i = 0; i < array.Length; i++)
+		{
+			Tool colliderTool = array[i].GetColliderTool();
+			if (!(colliderTool != null) || !ToolIsHighlightable(colliderTool, physicalPickup))
+			{
+				continue;
+			}
+			Vector3 lhs = colliderTool.ToolRenderer.Bounds.center - handCenter.position;
+			if (Vector3.Dot(lhs, handCenter.right) >= 0f)
+			{
+				float magnitude = lhs.magnitude;
+				if (magnitude < closestToolDistance)
+				{
+					closestTool = colliderTool;
+					closestToolDistance = magnitude;
+				}
+			}
+		}
+		return closestTool;
+	}
+
+	private Tool FindClosestToolInMagnetPickupRange(out Vector3 selectionVector)
+	{
+		selectionVector = (handCenter.position - ThisPlayer.Head.transform.position).normalized;
+		Vector3 origin = handCenter.position + selectionVector * magnetPickupCapsuleRadius;
+		float maxDistance = magnetPickupCapsuleLength - 2f * magnetPickupCapsuleRadius;
+		int num = Physics.SphereCastNonAlloc(origin, magnetPickupCapsuleRadius, selectionVector, pickupHits, maxDistance, 402432);
+		float num2 = float.MaxValue;
+		float closestToolDistance = float.MaxValue;
+		Tool closestTool = null;
+		for (int i = 0; i < num; i++)
+		{
+			Tool colliderTool = pickupHits[i].collider.GetColliderTool();
+			if (colliderTool != null && ToolIsHighlightable(colliderTool, false))
+			{
+				Bounds bounds = colliderTool.ToolRenderer.Bounds;
+				Vector3 center = bounds.center;
+				Vector3 vector = handCenter.position - center;
+				Vector3 vector2 = vector - Vector3.Project(vector, selectionVector);
+				float magnitude = bounds.extents.magnitude;
+				Vector3 vector3 = center + vector2.normalized * magnitude;
+				Vector3 lhs = vector3 - handCenter.position;
+				float num3 = Vector3.Dot(lhs, selectionVector);
+				if (num3 >= 0f && num3 < num2)
+				{
+					closestTool = colliderTool;
+					closestToolDistance = vector.magnitude;
+				}
+			}
+		}
+		FindClosestToolInSphere(ref closestTool, ref closestToolDistance, magnetPickupSphereRadius, false);
+		return closestTool;
+	}
+
+	private void FindClosestOutfitTrigger()
+	{
+		bool flag = false;
+		if (ThisPlayer.IsInChangingRoom)
+		{
+			RaycastHit[] array = Physics.RaycastAll(handCenter.position - handCenter.forward * outfitBackwardPickupRange, handCenter.forward, outfitBackwardPickupRange + outfitForwardPickupRange, 32768);
+			if (array != null)
+			{
+				array.SortByDistanceToCenter();
+				for (int i = 0; i < array.Length; i++)
+				{
+					OutfitTrigger component = array[i].collider.GetComponent<OutfitTrigger>();
+					if (component != null && component.Outfit != null && component.Outfit.Owner == ThisPlayer && component.Outfit.CurrentBodyPart != (Player.BodyPart)((Type != 0) ? 3 : 2) && component.Outfit.Type != OutfitManager.OutfitType.Shirt)
+					{
+						TriggeredOutfit = component;
+						flag = true;
+						break;
+					}
+				}
+			}
+		}
+		if (!flag)
+		{
+			TriggeredOutfit = null;
+		}
+	}
+
+	private void UpdateAnimation()
+	{
+		if (IsVisible)
+		{
+			OpenClosedAxis = ControllerIO.TriggerAxis;
+			if (handAnimator.isActiveAndEnabled)
+			{
+				handAnimator.SetFloat(openClosedAnimatorId, OpenClosedAxis);
+			}
+			if (ControllerIO.Touchpad.Swipe(SteamVRTouchpadConfig.TouchpadSwipeType.Up))
+			{
+				ThisPlayer.FacialAnimator.PlayEmoteUp();
+			}
+			else if (ControllerIO.Touchpad.Swipe(SteamVRTouchpadConfig.TouchpadSwipeType.Down))
+			{
+				ThisPlayer.FacialAnimator.PlayEmoteDown();
+			}
+			else if (ControllerIO.Touchpad.Swipe(SteamVRTouchpadConfig.TouchpadSwipeType.Left))
+			{
+				ThisPlayer.FacialAnimator.PlayEmoteLeft();
+			}
+			else if (ControllerIO.Touchpad.Swipe(SteamVRTouchpadConfig.TouchpadSwipeType.Right))
+			{
+				ThisPlayer.FacialAnimator.PlayEmoteRight();
+			}
+		}
+	}
+
+	public void OnPhotonSerializeView(PhotonStream stream, PhotonMessageInfo info)
+	{
+		if (stream.isReading)
+		{
+			OpenClosedAxis = (float)stream.ReceiveNext();
+			if (handAnimator.isActiveAndEnabled)
+			{
+				handAnimator.SetFloat(openClosedAnimatorId, OpenClosedAxis);
+			}
+			LaserTeleporter.LaserMode laserMode = (LaserTeleporter.LaserMode)(int)stream.ReceiveNext();
+			if (!ThisPlayer.IsVisible)
+			{
+				PlayerHandRemote.Mode = LaserTeleporter.LaserMode.Disabled;
+			}
+			else
+			{
+				PlayerHandRemote.Mode = laserMode;
+			}
+			if (laserMode != LaserTeleporter.LaserMode.Disabled)
+			{
+				Vector3 initialTangent = (Vector3)stream.ReceiveNext();
+				Vector3 vector = (Vector3)stream.ReceiveNext();
+				Vector3 finalPoint = (Vector3)stream.ReceiveNext();
+				Vector3 zero = Vector3.zero;
+				Vector3 zero2 = Vector3.zero;
+				if ((bool)stream.ReceiveNext())
+				{
+					zero = (Vector3)stream.ReceiveNext();
+					zero2 = (Vector3)stream.ReceiveNext();
+					PlayerHandRemote.ParabolicPointer.SetParabolaPointsWithReflection(initialTangent, vector, zero, zero2, finalPoint);
+				}
+				else
+				{
+					PlayerHandRemote.ParabolicPointer.SetParabolaPoints(initialTangent, vector, finalPoint);
+				}
+			}
+			return;
+		}
+		stream.SendNext(OpenClosedAxis);
+		stream.SendNext((int)PlayerHandRemote.Mode);
+		if (PlayerHandRemote.Mode != LaserTeleporter.LaserMode.Disabled)
+		{
+			stream.SendNext(PlayerHandRemote.ParabolicPointer.InitialParabolaTangent);
+			stream.SendNext(PlayerHandRemote.ParabolicPointer.FinalParabolaTangent);
+			stream.SendNext(PlayerHandRemote.ParabolicPointer.SelectedPoint);
+			stream.SendNext(PlayerHandRemote.ParabolicPointer.Reflected);
+			if (PlayerHandRemote.ParabolicPointer.Reflected)
+			{
+				stream.SendNext(PlayerHandRemote.ParabolicPointer.ReflectionPoint);
+				stream.SendNext(PlayerHandRemote.ParabolicPointer.ReflectionNormal);
+			}
+		}
+	}
+
+	private void UpdateTool()
+	{
+		if (!isHandTrackingCached)
+		{
+			return;
+		}
+		bool flag = ControllerIO.HairTriggerButtonDown || (ControllerIO.HairTriggerButtonPressed && !ControllerIO.HairTriggerButtonPressedConsumed && Time.unscaledTime - ControllerIO.HairTriggerButtonDownTime <= hairTriggerReactionWindow);
+		bool hairTriggerButtonDown = ControllerIO.HairTriggerButtonDown;
+		bool hairTriggerButtonUp = ControllerIO.HairTriggerButtonUp;
+		bool triggerButtonUp = ControllerIO.TriggerButtonUp;
+		bool menuButtonUp = ControllerIO.MenuButtonUp;
+		bool flag2 = flag;
+		bool triggerButtonPressed = ControllerIO.TriggerButtonPressed;
+		bool flag3 = hairTriggerButtonUp;
+		float triggerAxis = ControllerIO.TriggerAxis;
+		if (Tool != null)
+		{
+			if (Tool.IsLocked)
+			{
+				Tool.InputAmount = triggerAxis;
+				if (flag2)
+				{
+					Tool.OnInputDown();
+					ControllerIO.HairTriggerButtonPressedConsumed = true;
+				}
+				if (triggerButtonPressed)
+				{
+					Tool.OnInputPressed();
+				}
+				if (flag3)
+				{
+					Tool.OnInputUp();
+				}
+				if (menuButtonUp && Tool.IsLocked)
+				{
+					Tool.IsLocked = false;
+					Vibrate(500);
+					if (!triggerButtonPressed)
+					{
+						ThisPlayer.ToolController.ReleaseTool(Tool);
+					}
+				}
+			}
+			else if (!Tool.IsLocked && menuButtonUp)
+			{
+				Tool.IsLocked = true;
+				Vibrate(500);
+			}
+			else if ((!Tool.IsSmartTool && hairTriggerButtonUp) || (Tool.IsSmartTool && triggerButtonUp))
+			{
+				if (Tool.IsSmartTool)
+				{
+					ControllerIO.HairTriggerButtonPressedConsumed = true;
+				}
+				ThisPlayer.ToolController.ReleaseTool(Tool);
+			}
+		}
+		else if (!TryRemoveTriggeredOutfit(hairTriggerButtonDown) && hoveredTool != null)
+		{
+			bool flag4 = hairTriggerButtonDown;
+			if (hoveredTool.SupportsAssistedCatching)
+			{
+				flag4 = flag;
+			}
+			if (flag4)
+			{
+				TryPickupHoveredTool();
+				ControllerIO.HairTriggerButtonPressedConsumed = true;
+			}
+		}
+	}
+
+	private bool TryRemoveTriggeredOutfit(bool buttonDown)
+	{
+		Vector3 handSpacePickupPosition = Vector3.zero;
+		Quaternion handSpacePickupRotation = Quaternion.identity;
+		if (buttonDown && ThisPlayer.IsInChangingRoom && TriggeredOutfit != null)
+		{
+			Guid guid = TriggeredOutfit.Outfit.Guid;
+			Vector3 position = TriggeredOutfit.transform.position;
+			Quaternion rotation = TriggeredOutfit.transform.rotation;
+			ThisPlayer.PlayerOutfit.RemoveOutfit(TriggeredOutfit.Outfit, true);
+			OutfitTool outfitTool = OutfitTool.Find(guid);
+			if (outfitTool != null)
+			{
+				outfitTool.DontCollideWithPlayer(1f);
+				outfitTool.transform.position = position;
+				outfitTool.transform.rotation = rotation;
+				GetToolPickupPositionAndRotation(outfitTool, true, Vector3.zero, out handSpacePickupPosition, out handSpacePickupRotation);
+				ThisPlayer.ToolController.TryPickupTool(outfitTool, handSpacePickupPosition, handSpacePickupRotation, (int)Type);
+			}
+			ControllerIO.HairTriggerButtonPressedConsumed = true;
+			return true;
+		}
+		return false;
+	}
+
+	private void TryPickupHoveredTool()
+	{
+		Vector3 handSpacePickupPosition = Vector3.zero;
+		Quaternion handSpacePickupRotation = Quaternion.identity;
+		GetToolPickupPositionAndRotation(hoveredTool, !hoveredToolInPhysicalPickupRange, gravityPickupVector, out handSpacePickupPosition, out handSpacePickupRotation);
+		ThisPlayer.ToolController.TryPickupTool(hoveredTool, handSpacePickupPosition, handSpacePickupRotation, (int)Type);
+	}
+
+	private bool ToolIsHighlightable(Tool tool, bool physicalPickup)
+	{
+		if (!ThisPlayer.CanInteractWithTools)
+		{
+			return false;
+		}
+		if (tool == null)
+		{
+			return false;
+		}
+		if (tool.IsHeld && (tool.Owner != ThisPlayer || !physicalPickup))
+		{
+			return false;
+		}
+		if (tool.OnlyOwnerCanPickup && tool.Owner != ThisPlayer)
+		{
+			return false;
+		}
+		if (!physicalPickup && !tool.SupportsAssistedCatching && tool.IsMoving)
+		{
+			return false;
+		}
+		if (!tool.ToolRenderer.Visible)
+		{
+			return false;
+		}
+		if (tool.IsLocked)
+		{
+			return false;
+		}
+		if (tool.PlayerInteractionRestriction != null && !tool.PlayerInteractionRestriction.PlayerInteractionAllowed(ThisPlayer))
+		{
+			return false;
+		}
+		return (physicalPickup && tool.SupportsPhysicalPickup) || (!physicalPickup && (tool.SupportsGravityPickup || tool.SupportsOffCenterGravityPickup));
+	}
+
+	private void OnGameStateChanged(ActivityGameState previous, ActivityGameState next)
+	{
+		if (ThisPlayer != null)
+		{
+			OnPlayerRolesUpdated(ThisPlayer.PhotonPlayer);
+		}
+	}
+
+	private void OnPlayerRolesUpdated(PhotonPlayer updatedPlayer)
+	{
+		if (ThisPlayer != null && ThisPlayer.PhotonPlayer != null && updatedPlayer == ThisPlayer.PhotonPlayer && Tool != null)
+		{
+			if (Tool.PlayerInteractionRestriction != null && !Tool.PlayerInteractionRestriction.PlayerInteractionAllowed(ThisPlayer))
+			{
+				ReleaseTool();
+			}
+			else
+			{
+				Tool.OnOwnerRoleUpdated();
+			}
+		}
+	}
+
+	public void BroadcastRemoteVisibility(bool visible)
+	{
+		if (base.isLocal)
+		{
+			base.photonView.RPC("RpcRemoteVisibilityChanged", PhotonTargets.Others, visible);
+		}
+	}
+
+	[PunRPC]
+	public void RpcRemoteVisibilityChanged(bool visible)
+	{
+		RemoteVisible = visible && ThisPlayer.IsVisible;
+	}
+
+	public static PlayerHand Find(int photonViewId)
+	{
+		PhotonView photonView = PhotonView.Find(photonViewId);
+		if (photonView != null)
+		{
+			return photonView.GetComponent<PlayerHand>();
+		}
+		return null;
+	}
+
+	private void OnDrawGizmos()
+	{
+		Gizmos.color = Color.green;
+		Gizmos.DrawWireSphere(handCenter.position, physicalPickupSphereRadius);
+	}
+}
